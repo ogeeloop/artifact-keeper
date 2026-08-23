@@ -184,6 +184,13 @@ const STUCK_SCAN_THRESHOLD_FLOOR_SECS: u64 = 60;
 /// scheduler.
 const STUCK_SCAN_INTERVAL_FLOOR_SECS: u64 = 30;
 
+/// Default lifetime of a signed Terraform/OpenTofu network-mirror archive URL.
+///
+/// Long enough for a client to read `<version>.json`, download every platform
+/// archive it needs and retry a failed one; short enough that a URL captured
+/// from a CI log is not a durable credential.
+pub const DEFAULT_TERRAFORM_MIRROR_URL_TTL_SECS: u64 = 300;
+
 fn clamp_stuck_scan_threshold(value: u64) -> u64 {
     if value < STUCK_SCAN_THRESHOLD_FLOOR_SECS {
         tracing::warn!(
@@ -290,6 +297,21 @@ pub struct Config {
     /// `[MIN_SIGNATURE_EXPIRY_SECONDS, MAX_SIGNATURE_EXPIRY_SECONDS]` by
     /// [`crate::services::signing_service::signature_expiry_duration`].
     pub signature_expiry_seconds: u64,
+
+    /// Lifetime, in seconds, of a signed Terraform/OpenTofu network-mirror
+    /// archive URL.
+    ///
+    /// The mirror protocol forbids clients from sending credentials on the
+    /// archive request, so a private mirror repository authorizes those
+    /// fetches with a signature embedded in the URL it hands out
+    /// ([`crate::services::mirror_url_signing`]). This window has to outlast a
+    /// whole `tofu init`: the client reads `<version>.json` first and only
+    /// then downloads each platform archive, possibly retrying. Five minutes
+    /// covers a slow multi-provider install without leaving a leaked URL
+    /// usable for long. Set to `0` to stop emitting signed URLs entirely, in
+    /// which case a private mirror repository is reachable only by clients
+    /// that can authenticate the archive request themselves.
+    pub terraform_mirror_url_ttl_secs: u64,
 
     /// JWT token expiration in seconds (legacy, use jwt_access_token_expiry_minutes)
     pub jwt_expiration_secs: u64,
@@ -900,6 +922,7 @@ redacted_debug!(Config {
     show s3_region,
     show s3_endpoint,
     redact jwt_secret,
+    show terraform_mirror_url_ttl_secs,
     show jwt_expiration_secs,
     show jwt_access_token_expiry_minutes,
     show jwt_refresh_token_expiry_days,
@@ -1018,6 +1041,7 @@ impl Default for Config {
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             signature_expiry_seconds:
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            terraform_mirror_url_ttl_secs: DEFAULT_TERRAFORM_MIRROR_URL_TTL_SECS,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -1162,6 +1186,10 @@ impl Config {
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            ),
+            terraform_mirror_url_ttl_secs: env_parse(
+                "TERRAFORM_MIRROR_URL_TTL_SECS",
+                DEFAULT_TERRAFORM_MIRROR_URL_TTL_SECS,
             ),
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
             jwt_access_token_expiry_minutes: env_parse("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", 30),

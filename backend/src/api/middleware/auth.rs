@@ -1322,15 +1322,26 @@ async fn try_resolve_ticket_auth(
         return None;
     }
 
-    // Load the owning user. We block deactivated users so a revoked account
-    // cannot keep downloading via outstanding tickets, but we honour service
-    // accounts and not-yet-rotated passwords because the ticket itself is
-    // the proof of intent: the JWT session that minted it had whatever
-    // rights the user had at mint time.
-    //
-    // Uses `sqlx::query_as::<_, User>` rather than the `query_as!` macro so
-    // adding the ticket-consumer middleware does not require regenerating
-    // the offline SQLx query cache.
+    read_only_auth_extension(db, user_id).await
+}
+
+/// Load `user_id` and shape it into the read-only [`AuthExtension`] that a
+/// URL-borne credential authenticates as.
+///
+/// Shared by the two credentials that travel in a URL rather than a header:
+/// download tickets, and the signed Terraform mirror archive URLs a private
+/// mirror repository hands out ([`try_resolve_signed_mirror_auth`]). Both
+/// authorize a read the minting principal could already perform, so both want
+/// the same identity with the same elevation stripped.
+///
+/// We block deactivated users so a revoked account cannot keep downloading via
+/// outstanding URLs, but we honour service accounts and not-yet-rotated
+/// passwords because the minted URL is itself the proof of intent: the session
+/// that minted it had whatever rights the user had at mint time.
+///
+/// Uses `sqlx::query_as::<_, User>` rather than the `query_as!` macro so that
+/// adding a caller does not require regenerating the offline SQLx query cache.
+async fn read_only_auth_extension(db: &sqlx::PgPool, user_id: Uuid) -> Option<AuthExtension> {
     let user: User = sqlx::query_as::<_, User>(
         r#"
         SELECT
@@ -1349,28 +1360,78 @@ async fn try_resolve_ticket_auth(
     .ok()??;
 
     let mut ext = AuthExtension::from(user);
-    // Tickets are read-only. Drop admin elevation so a ticket minted by an
-    // admin cannot be replayed against admin-only routes that happen to
-    // accept tickets in their middleware chain. Callers also insert the
-    // [`DownloadTicketAuth`] marker extension so write-gating middleware
-    // can recognise the request as ticket-authenticated.
+    // Read-only. Drop admin elevation so a URL minted by an admin cannot be
+    // replayed against admin-only routes that happen to accept these
+    // credentials in their middleware chain. Callers also mark the request so
+    // write-gating middleware can recognise it.
     ext.is_admin = false;
 
     // Scope hardening: `AuthExtension::has_scope` returns `true` only when
     // `scopes` is `None` (action-unrestricted). No handler today calls
     // `has_scope("admin")` for elevation, but a future one could, and a
-    // ticket-authenticated request must not silently pass that check. Stamp an
+    // URL-authenticated request must not silently pass that check. Stamp an
     // empty scope allowlist so any explicit scope check defaults to deny.
     //
     // This intentionally does not modify `is_service_account` or
-    // `must_change_password`: a ticket inherits the minter's identity for
+    // `must_change_password`: the request inherits the minter's identity for
     // those flags so downstream handlers see the same view they would for
     // any other auth method. Accepting the inherited identity is the
-    // design — the ticket is proof that a session with those flags
-    // intentionally minted a download URL.
+    // design — the URL is proof that a session with those flags
+    // intentionally minted it.
     ext.is_api_token = true;
     ext.scopes = Some(vec![]);
     Some(ext)
+}
+
+/// Snapshot of the request fields needed to authenticate a signed Terraform
+/// mirror archive URL, cloned out of the [`Request`] for the same
+/// borrow-across-`await` reason as [`TicketRequestParts`].
+struct SignedMirrorParts {
+    path: String,
+    query: String,
+    method: Method,
+}
+
+fn extract_signed_mirror_parts(request: &Request) -> Option<SignedMirrorParts> {
+    let query = request.uri().query()?;
+    let path = request.uri().path();
+    // Cheap shape check before any crypto: only the mirror archive route can
+    // ever be opened by one of these signatures.
+    if !crate::api::handlers::terraform::is_mirror_archive_path(path) {
+        return None;
+    }
+    Some(SignedMirrorParts {
+        path: path.to_string(),
+        query: query.to_string(),
+        method: request.method().clone(),
+    })
+}
+
+/// Try to authenticate a provider network-mirror archive fetch from the
+/// signature embedded in its URL.
+///
+/// The mirror protocol requires clients to fetch these archives with **no**
+/// credentials — see [`crate::services::mirror_url_signing`] for why — so on a
+/// private repository this is the only credential the request can carry. The
+/// signature is minted by the `<version>.json` handler for the principal that
+/// authenticated *that* request, and commits to this exact path, so it can
+/// only re-open a download that principal was already entitled to.
+async fn try_resolve_signed_mirror_auth(
+    db: &sqlx::PgPool,
+    server_secret: &str,
+    parts: &SignedMirrorParts,
+) -> Option<AuthExtension> {
+    // Same read-only restriction as tickets, for the same reason.
+    if !ticket_method_allowed(&parts.method) {
+        return None;
+    }
+    let claims = crate::services::mirror_url_signing::verify(
+        server_secret,
+        &parts.path,
+        Some(&parts.query),
+        chrono::Utc::now().timestamp(),
+    )?;
+    read_only_auth_extension(db, claims.user_id).await
 }
 
 /// Snapshot of the request fields needed to authenticate a download ticket.
@@ -1568,6 +1629,10 @@ pub async fn admin_middleware(
 pub struct RepoVisibilityState {
     pub auth_service: Arc<AuthService>,
     pub db: sqlx::PgPool,
+    /// Server secret backing signed Terraform network-mirror archive URLs
+    /// (`Config::jwt_secret`; see [`crate::services::mirror_url_signing`],
+    /// which derives its own key from it under a domain separator).
+    pub mirror_url_secret: Arc<str>,
     /// Shared with `AppState::repo_cache` so format-handler resolvers can
     /// reuse the repo metadata fetched here without a second DB round-trip.
     pub repo_cache: RepoCache,
@@ -2317,6 +2382,24 @@ pub async fn repo_visibility_middleware(
         }
     }
 
+    // Fall back to a signed Terraform network-mirror archive URL. The mirror
+    // protocol forbids the client from sending any credential on this one
+    // request, so without this a private mirror repository 401s partway
+    // through every `tofu init` — after the metadata requests have already
+    // authenticated. Read-only and bound to this exact path by the signature.
+    let mut authed_via_url_signature = false;
+    if auth_ext.is_none() {
+        if let Some(parts) = extract_signed_mirror_parts(&request) {
+            if let Some(ext) =
+                try_resolve_signed_mirror_auth(&vis_state.db, &vis_state.mirror_url_secret, &parts)
+                    .await
+            {
+                auth_ext = Some(ext);
+                authed_via_url_signature = true;
+            }
+        }
+    }
+
     // Off-boarding (#1371): explicit credential presented but invalid (and
     // no rescuing ticket) means 401, not anonymous read.
     if credential_invalid && auth_ext.is_none() {
@@ -2338,7 +2421,10 @@ pub async fn repo_visibility_middleware(
     // be writable: a ticket is effectively a single-use download URL, not a
     // capability token. Treat ticket-authenticated requests as anonymous for
     // the purpose of write gating.
-    let has_write_auth = auth_ext.is_some() && !authed_via_ticket;
+    // A signed mirror URL is a download URL, not a capability token, so it is
+    // gated exactly like a ticket here even though its resolver already
+    // refuses non-read methods.
+    let has_write_auth = auth_ext.is_some() && !authed_via_ticket && !authed_via_url_signature;
     if is_write && !has_write_auth {
         return unauthorized_response();
     }
@@ -6747,6 +6833,7 @@ mod tests {
         RepoVisibilityState {
             auth_service,
             db: pool,
+            mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             repo_cache: cache,
             permission_service,
         }
@@ -7253,6 +7340,7 @@ mod tests {
         let state = RepoVisibilityState {
             auth_service,
             db: pool.clone(),
+            mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             repo_cache: cache,
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
@@ -7721,6 +7809,7 @@ mod tests {
             RepoVisibilityState {
                 auth_service: auth,
                 db: pool.clone(),
+                mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
                 repo_cache: cache,
                 permission_service: Arc::new(PermissionService::new(pool.clone())),
             }
@@ -7861,6 +7950,7 @@ mod tests {
             RepoVisibilityState {
                 auth_service: auth,
                 db: pool.clone(),
+                mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
                 repo_cache: cache,
                 permission_service: Arc::new(PermissionService::new(pool.clone())),
             }
@@ -8005,6 +8095,7 @@ mod tests {
         let mk_state = || RepoVisibilityState {
             auth_service: auth_service.clone(),
             db: pool.clone(),
+            mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
@@ -8454,6 +8545,7 @@ mod tests {
         let state = RepoVisibilityState {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
+            mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             repo_cache: cache,
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
@@ -8598,6 +8690,7 @@ mod tests {
         let state = RepoVisibilityState {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
+            mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             repo_cache: cache,
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };

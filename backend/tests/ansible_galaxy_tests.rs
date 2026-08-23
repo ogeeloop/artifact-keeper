@@ -151,6 +151,7 @@ impl Ctx {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_str.clone(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            terraform_mirror_url_ttl_secs: 300,
             setup_password_hint: None,
             ..Default::default()
         };
@@ -184,6 +185,7 @@ impl Ctx {
         let vis_state = RepoVisibilityState {
             auth_service,
             db: state.db.clone(),
+            mirror_url_secret: state.config.jwt_secret.clone().into(),
             repo_cache: state.repo_cache.clone(),
             permission_service: state.permission_service.clone(),
         };

@@ -51,6 +51,7 @@ pub fn create_router(state: SharedState) -> Router {
     let vis_state = RepoVisibilityState {
         auth_service: vis_auth_service,
         db: state.db.clone(),
+        mirror_url_secret: state.config.jwt_secret.clone().into(),
         repo_cache: state.repo_cache.clone(),
         permission_service: state.permission_service.clone(),
     };

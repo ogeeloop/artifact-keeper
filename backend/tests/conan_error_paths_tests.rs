@@ -54,6 +54,7 @@ fn test_config(storage_path: &str) -> Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         storage_path: storage_path.into(),
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        terraform_mirror_url_ttl_secs: 300,
         setup_password_hint: None,
         ..Default::default()
     }
@@ -166,6 +167,7 @@ fn build_full_stack_router(state: SharedState) -> Router {
     let vis_state = RepoVisibilityState {
         auth_service,
         db: state.db.clone(),
+        mirror_url_secret: state.config.jwt_secret.clone().into(),
         repo_cache: state.repo_cache.clone(),
         permission_service: state.permission_service.clone(),
     };

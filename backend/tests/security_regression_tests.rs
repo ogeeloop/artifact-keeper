@@ -515,6 +515,7 @@ mod qc_metadata_leak_2437 {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_path.into(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            terraform_mirror_url_ttl_secs: 300,
             setup_password_hint: None,
             ..Default::default()
         };
@@ -757,6 +758,7 @@ mod age_gate_config_2264 {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_path.into(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            terraform_mirror_url_ttl_secs: 300,
             ..Default::default()
         };
         let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
@@ -928,6 +930,7 @@ mod scan_sbom_leak_2439 {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_path.into(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            terraform_mirror_url_ttl_secs: 300,
             setup_password_hint: None,
             ..Default::default()
         };
@@ -1339,6 +1342,7 @@ mod xrepo_authz_2443 {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_path.into(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            terraform_mirror_url_ttl_secs: 300,
             setup_password_hint: None,
             ..Default::default()
         };

@@ -37,6 +37,7 @@ pub mod maven_flat_attribution;
 pub mod metadata_checker;
 pub mod migration_service;
 pub mod migration_worker;
+pub mod mirror_url_signing;
 pub mod nexus_client;
 pub mod npm_packument_cache;
 pub mod oci_manifest_refs_backfill;
