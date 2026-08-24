@@ -6745,10 +6745,9 @@ mod tests {
             crate::services::permission_service::PermissionService::new(pool.clone()),
         );
         RepoVisibilityState {
-            auth_service,
-            db: pool,
             repo_cache: cache,
             permission_service,
+            ..crate::testing::vis_state(pool, auth_service)
         }
     }
 
@@ -7214,7 +7213,6 @@ mod tests {
         actions: &[&str],
     ) -> Option<(sqlx::PgPool, RepoVisibilityState, String, Uuid, Uuid)> {
         use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let pool = tdh::try_pool().await?;
@@ -7251,10 +7249,8 @@ mod tests {
             }
         }
         let state = RepoVisibilityState {
-            auth_service,
-            db: pool.clone(),
             repo_cache: cache,
-            permission_service: Arc::new(PermissionService::new(pool.clone())),
+            ..crate::testing::vis_state(pool.clone(), auth_service)
         };
         Some((pool, state, bearer, user_id, decoy_id))
     }
@@ -7646,7 +7642,6 @@ mod tests {
     async fn test_private_repo_without_rules_denies_unassigned_nonadmin() {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::models::user::{AuthProvider, User};
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -7719,10 +7714,8 @@ mod tests {
                 .await
                 .insert(repo_key.to_string(), (entry, std::time::Instant::now()));
             RepoVisibilityState {
-                auth_service: auth,
-                db: pool.clone(),
                 repo_cache: cache,
-                permission_service: Arc::new(PermissionService::new(pool.clone())),
+                ..crate::testing::vis_state(pool.clone(), auth)
             }
         }
 
@@ -7786,7 +7779,6 @@ mod tests {
     async fn test_ext_wasm_proxy_route_enforces_repo_visibility() {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::models::user::{AuthProvider, User};
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -7859,10 +7851,8 @@ mod tests {
                 .await
                 .insert(repo_key.to_string(), (entry, std::time::Instant::now()));
             RepoVisibilityState {
-                auth_service: auth,
-                db: pool.clone(),
                 repo_cache: cache,
-                permission_service: Arc::new(PermissionService::new(pool.clone())),
+                ..crate::testing::vis_state(pool.clone(), auth)
             }
         }
 
@@ -7953,7 +7943,6 @@ mod tests {
     async fn test_percent_encoded_repo_key_cannot_bypass_repo_visibility() {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::models::user::{AuthProvider, User};
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -8002,12 +7991,7 @@ mod tests {
         // Fresh state per request with an EMPTY repo cache, so the middleware
         // really queries the DB with the (decoded) key instead of short-
         // circuiting on a pre-populated entry.
-        let mk_state = || RepoVisibilityState {
-            auth_service: auth_service.clone(),
-            db: pool.clone(),
-            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            permission_service: Arc::new(PermissionService::new(pool.clone())),
-        };
+        let mk_state = || crate::testing::vis_state(pool.clone(), auth_service.clone());
 
         // Percent-encode the first character of the real repo key (repo keys
         // are alphanumeric plus `-`, `_`, `.`), e.g. `private` -> `%70rivate`.
@@ -8400,7 +8384,6 @@ mod tests {
 
     async fn role_assignment_read_fixture(repo_key: &str) -> Option<RoleGateFixture> {
         use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let pool = tdh::try_pool().await?;
@@ -8452,10 +8435,11 @@ mod tests {
                 .insert(repo_key.to_string(), (entry, std::time::Instant::now()));
         }
         let state = RepoVisibilityState {
-            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
-            db: pool.clone(),
             repo_cache: cache,
-            permission_service: Arc::new(PermissionService::new(pool.clone())),
+            ..crate::testing::vis_state(
+                pool.clone(),
+                Arc::new(AuthService::new(pool.clone(), config)),
+            )
         };
         Some(RoleGateFixture {
             pool,
@@ -8563,7 +8547,6 @@ mod tests {
     #[tokio::test]
     async fn test_3452_private_no_grant_stays_indistinguishable_from_no_such_repository() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -8596,10 +8579,11 @@ mod tests {
             );
         }
         let state = RepoVisibilityState {
-            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
-            db: pool.clone(),
             repo_cache: cache,
-            permission_service: Arc::new(PermissionService::new(pool.clone())),
+            ..crate::testing::vis_state(
+                pool.clone(),
+                Arc::new(AuthService::new(pool.clone(), config)),
+            )
         };
 
         async fn probe(

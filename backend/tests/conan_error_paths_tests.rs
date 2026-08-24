@@ -164,10 +164,9 @@ fn build_full_stack_router(state: SharedState) -> Router {
         Arc::new(state.config.clone()),
     ));
     let vis_state = RepoVisibilityState {
-        auth_service,
-        db: state.db.clone(),
         repo_cache: state.repo_cache.clone(),
         permission_service: state.permission_service.clone(),
+        ..artifact_keeper_backend::testing::vis_state(state.db.clone(), auth_service)
     };
     Router::new()
         .nest("/conan", conan::router())

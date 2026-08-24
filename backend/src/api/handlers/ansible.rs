@@ -1195,9 +1195,8 @@ mod tests {
     /// the `Token` scheme.
     #[tokio::test]
     async fn test_3137_galaxy_api_through_visibility_middleware() {
-        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        use crate::api::middleware::auth::repo_visibility_middleware;
         use crate::services::auth_service::AuthService;
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
@@ -1215,12 +1214,7 @@ mod tests {
             .await
             .expect("generate api token");
 
-        let vis_state = RepoVisibilityState {
-            auth_service: auth_service.clone(),
-            db: f.pool.clone(),
-            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            permission_service: Arc::new(PermissionService::new(f.pool.clone())),
-        };
+        let vis_state = crate::testing::vis_state(f.pool.clone(), auth_service.clone());
         // Mount the real handler table under the real middleware at the real
         // `/ansible` prefix so `extract_repo_key` sees the production path
         // shape (`/{format}/{repo_key}/...`).
@@ -1714,9 +1708,8 @@ mod tests {
     /// assuming it, on the real client URL, against a PRIVATE repository.
     #[tokio::test]
     async fn test_3282_import_status_through_visibility_middleware() {
-        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        use crate::api::middleware::auth::repo_visibility_middleware;
         use crate::services::auth_service::AuthService;
-        use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
 
         let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
@@ -1736,12 +1729,7 @@ mod tests {
             .await
             .expect("generate api token");
 
-        let vis_state = RepoVisibilityState {
-            auth_service: auth_service.clone(),
-            db: f.pool.clone(),
-            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            permission_service: Arc::new(PermissionService::new(f.pool.clone())),
-        };
+        let vis_state = crate::testing::vis_state(f.pool.clone(), auth_service.clone());
         let state = f.state.clone();
         let app = move || {
             axum::Router::new()
