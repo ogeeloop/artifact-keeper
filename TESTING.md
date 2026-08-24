@@ -66,6 +66,36 @@ cargo test --test integration_tests
 - `backend/tests/integration_tests.rs` - API integration tests
 - `backend/src/**/*.rs` - Unit tests (inline `#[cfg(test)]` modules)
 
+### Building test fixtures: never spell out every field
+
+`Config` has ~115 fields and `RepoVisibilityState` is built by a dozen tests.
+Rust struct literals are exhaustive, so a test that names every field breaks the
+moment anyone adds one — and the PR that adds it then has to edit unrelated
+ansible, conan and OCI test files to compile. Build these through the shared
+constructors instead, naming only what the test actually exercises:
+
+```rust
+// Unit tests inside the crate (`#[cfg(test)]`):
+let config = Config { jwt_secret: "…".into(), ..Config::test_config() };
+
+// Integration tests under `backend/tests/` (compiled without `cfg(test)`,
+// so `test_config()` is not visible there):
+let config = Config { storage_path: dir.into(), ..Default::default() };
+
+// The visibility middleware's state, from either kind of test:
+let state = testing::vis_state(pool.clone(), auth_service);
+let state = RepoVisibilityState {
+    repo_cache: warm_cache,
+    ..testing::vis_state(pool.clone(), auth_service)
+};
+```
+
+A new field on either struct should then need a value in exactly one place:
+`Config::default()` in `backend/src/config.rs`, or `testing::vis_state` in
+`backend/src/testing.rs`. The production construction sites (`Config::from_env`,
+the `RepoVisibilityState` built in `api/routes.rs`) stay exhaustive on purpose,
+so adding a field still forces a deliberate decision about its real value.
+
 ## Automated E2E Testing with Docker
 
 Run fully automated E2E tests without any manual setup:

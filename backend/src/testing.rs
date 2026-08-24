@@ -25,7 +25,14 @@
 //! preserved.
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use sqlx::PgPool;
+
+use crate::api::middleware::auth::RepoVisibilityState;
+use crate::api::RepoCache;
+use crate::services::auth_service::AuthService;
+use crate::services::permission_service::PermissionService;
 
 /// Environment variable that marks the database as **required**. When set to a
 /// truthy value, a missing `DATABASE_URL` or a connect failure becomes a hard
@@ -232,6 +239,50 @@ async fn ensure_download_event_dispatch(url: &str) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+/// Build a [`RepoVisibilityState`] for a test, deriving every field that a test
+/// does not normally care about.
+///
+/// The middleware's state struct is constructed by a dozen tests across
+/// `auth.rs`, the format handlers and `backend/tests/`, and each one used to
+/// name all of its fields. Rust struct literals are exhaustive, so **adding one
+/// field to `RepoVisibilityState` meant editing every one of those tests** —
+/// a diff that touches ansible, conan and OCI test files to ship a change that
+/// has nothing to do with them, and that buries the real change in noise.
+///
+/// Route new construction through here instead, overriding only what the test
+/// actually exercises:
+///
+/// ```ignore
+/// // default cache and permission service
+/// let state = testing::vis_state(pool.clone(), auth_service);
+///
+/// // pre-populated cache, everything else defaulted
+/// let state = RepoVisibilityState {
+///     repo_cache: warm_cache,
+///     ..testing::vis_state(pool.clone(), auth_service)
+/// };
+/// ```
+///
+/// A field added to `RepoVisibilityState` after this then needs a value in
+/// exactly one place: here.
+///
+/// The permission service is derived from the same pool, which is what every
+/// caller passed by hand; the repo cache starts empty, which is what the
+/// middleware sees on a cold process.
+pub fn vis_state(db: PgPool, auth_service: Arc<AuthService>) -> RepoVisibilityState {
+    RepoVisibilityState {
+        auth_service,
+        permission_service: Arc::new(PermissionService::new(db.clone())),
+        repo_cache: empty_repo_cache(),
+        db,
+    }
+}
+
+/// An empty [`RepoCache`], as a fresh process has.
+pub fn empty_repo_cache() -> RepoCache {
+    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
 #[cfg(test)]

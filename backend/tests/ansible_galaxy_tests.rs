@@ -182,10 +182,9 @@ impl Ctx {
             .expect("mint read token");
 
         let vis_state = RepoVisibilityState {
-            auth_service,
-            db: state.db.clone(),
             repo_cache: state.repo_cache.clone(),
             permission_service: state.permission_service.clone(),
+            ..artifact_keeper_backend::testing::vis_state(state.db.clone(), auth_service)
         };
         // Mirrors `api/routes.rs`: the handler table is nested at `/ansible`
         // and the whole thing sits under `repo_visibility_middleware`, so
