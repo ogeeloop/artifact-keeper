@@ -151,7 +151,6 @@ impl Ctx {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_str.clone(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
-            terraform_mirror_url_ttl_secs: 300,
             setup_password_hint: None,
             ..Default::default()
         };
