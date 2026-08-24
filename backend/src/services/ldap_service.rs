@@ -1139,6 +1139,7 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             jwt_secret: "test-secret".into(),
+            terraform_mirror_url_ttl_secs: crate::config::DEFAULT_TERRAFORM_MIRROR_URL_TTL_SECS,
             signature_expiry_seconds: 604_800,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,

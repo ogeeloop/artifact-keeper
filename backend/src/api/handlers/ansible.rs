@@ -1218,6 +1218,7 @@ mod tests {
         let vis_state = RepoVisibilityState {
             auth_service: auth_service.clone(),
             db: f.pool.clone(),
+            mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(f.pool.clone())),
         };
@@ -1739,6 +1740,7 @@ mod tests {
         let vis_state = RepoVisibilityState {
             auth_service: auth_service.clone(),
             db: f.pool.clone(),
+            mirror_url_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(f.pool.clone())),
         };

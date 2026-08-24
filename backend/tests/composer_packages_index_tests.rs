@@ -54,6 +54,7 @@ fn test_config(storage_path: &str) -> Config {
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        terraform_mirror_url_ttl_secs: 300,
         signature_expiry_seconds: 604_800,
         setup_password_hint: None,
         jwt_expiration_secs: 86400,

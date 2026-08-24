@@ -27,7 +27,7 @@
 //! `.../binary/{os}/{arch}`, which streams the `.zip` itself.
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -50,6 +50,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::mirror_url_signing;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1270,6 +1271,34 @@ fn build_mirror_archive_url(version: &str, os: &str, arch: &str) -> String {
     format!("{}/download/{}/{}", version, os, arch)
 }
 
+/// True when `path` is the network-mirror **archive** route:
+/// `/terraform/{repo_key}/{hostname}/{namespace}/{type}/{version}/download/{os}/{arch}`.
+///
+/// Used by the repo-visibility middleware to bound where a signed URL can
+/// authenticate. The signature already commits to the full path, so this is
+/// defence in depth: even a minting bug elsewhere could not produce a
+/// signature that opens an upload route or another format's endpoint.
+///
+/// The provider *registry* route of the same tail shape
+/// (`/terraform/{repo}/v1/providers/{ns}/{type}/{version}/download/{os}/{arch}`)
+/// carries two extra segments and so does not match.
+pub(crate) fn is_mirror_archive_path(path: &str) -> bool {
+    let mut segments = path.trim_start_matches('/').split('/');
+    let mut nth = |n: usize| segments.by_ref().nth(n);
+    if nth(0) != Some(MOUNT_PREFIX.trim_start_matches('/')) {
+        return false;
+    }
+    // repo_key, hostname, namespace, type_name, version
+    if nth(4).is_none() {
+        return false;
+    }
+    if nth(0) != Some("download") {
+        return false;
+    }
+    // os, arch, and nothing after them.
+    nth(1).is_some() && nth(0).is_none()
+}
+
 /// Transform a registry-protocol `versions` document into a mirror-protocol
 /// `index.json` document.
 ///
@@ -1615,10 +1644,15 @@ fn assemble_mirror_archives(
     version: &str,
     platforms: &[(String, String)],
     shasums: &std::collections::HashMap<(String, String), String>,
+    signer: Option<&MirrorArchiveSigner>,
 ) -> serde_json::Value {
     let mut archives = serde_json::Map::new();
     for (os, arch) in platforms {
         let url = build_mirror_archive_url(version, os, arch);
+        let url = match signer {
+            Some(signer) => signer.sign(&url, version, os, arch),
+            None => url,
+        };
         let hashes = shasums
             .get(&(os.clone(), arch.clone()))
             .cloned()
@@ -1830,6 +1864,8 @@ async fn mirror_version(
         String,
         String,
     )>,
+    OriginalUri(uri): OriginalUri,
+    Extension(auth): Extension<Option<AuthExtension>>,
 ) -> Result<Response, Response> {
     let version = version_from_mirror_file(&version_file)?;
 
@@ -1872,9 +1908,117 @@ async fn mirror_version(
         return Err(mirror_not_found(&namespace, &type_name, version));
     }
 
+    // A private repository cannot be installed from unless the archive URLs
+    // authorize themselves: the client will fetch them with no credentials at
+    // all (see `mirror_archive_signer`).
+    let signer = mirror_archive_signer(&state, &repo_key, auth.as_ref(), uri.path()).await;
+
     Ok(json_ok_response(&assemble_mirror_archives(
-        version, &platforms, &shasums,
+        version,
+        &platforms,
+        &shasums,
+        signer.as_ref(),
     )))
+}
+
+/// Authorization to attach to the archive URLs emitted for one
+/// `<version>.json` request, or `None` when the archives need none.
+///
+/// Carries the absolute request path of the `<version>.json` document, which
+/// every archive path is derived from, plus the signing inputs.
+struct MirrorArchiveSigner {
+    /// Path of this metadata request with its final `<version>.json` segment
+    /// removed, so the archive path is `{base}/{version}/download/{os}/{arch}`.
+    /// Taken from the live request rather than rebuilt from the decoded route
+    /// parameters, so the signed bytes are exactly what the client will send
+    /// back on the wire.
+    base_path: String,
+    secret: String,
+    user_id: uuid::Uuid,
+    expires_at_unix: i64,
+}
+
+/// Decide whether this `<version>.json` response should hand out signed
+/// archive URLs, and with what inputs.
+///
+/// Signed URLs are emitted only when all of these hold:
+///
+/// * the repository is **private** — a public repository serves archives to
+///   anonymous callers already, so signing them would add a query string that
+///   authorizes nothing;
+/// * the metadata request was **authenticated** — the signature carries that
+///   principal's identity, and there is none to carry for an anonymous read
+///   (which, on a private repo, the visibility middleware has already
+///   rejected);
+/// * the operator has not set `TERRAFORM_MIRROR_URL_TTL_SECS=0`.
+///
+/// Visibility is read from the shared repo cache, which the visibility
+/// middleware populated for this very request. A stale entry can only cost us
+/// a signature we should have emitted — the client then fails with the same
+/// 401 it gets today, visibly — never a signature on a repo that should not
+/// have one.
+async fn mirror_archive_signer(
+    state: &SharedState,
+    repo_key: &str,
+    auth: Option<&AuthExtension>,
+    metadata_path: &str,
+) -> Option<MirrorArchiveSigner> {
+    let ttl = state.config.terraform_mirror_url_ttl_secs;
+    if ttl == 0 {
+        return None;
+    }
+    let auth = auth?;
+    let is_public = {
+        let cache = state.repo_cache.read().await;
+        cache.get(repo_key).map(|(entry, _)| entry.is_public)
+    };
+    if is_public != Some(false) {
+        return None;
+    }
+
+    // `/terraform/{repo}/{host}/{ns}/{type}/{version}.json` -> drop the file.
+    // Taken from the live request so the signed bytes are exactly what the
+    // client sends back, but the middleware that verifies sees the path with
+    // this router's mount prefix still on it. If we are looking at a
+    // prefix-less path — this router mounted somewhere else, or `OriginalUri`
+    // unavailable and axum having handed us the nested path — every signature
+    // we minted would verify against nothing and the archive fetch would 401
+    // just as it does today. Emit none and say so rather than hand out URLs
+    // that cannot work.
+    if !metadata_path.starts_with(&format!("{}/", MOUNT_PREFIX)) {
+        tracing::warn!(
+            path = metadata_path,
+            "terraform mirror metadata request path is missing the router mount prefix; \
+             not signing archive URLs"
+        );
+        return None;
+    }
+    let base_path = metadata_path.rsplit_once('/')?.0.to_string();
+
+    Some(MirrorArchiveSigner {
+        base_path,
+        secret: state.config.jwt_secret.clone(),
+        user_id: auth.user_id,
+        expires_at_unix: chrono::Utc::now().timestamp() + ttl as i64,
+    })
+}
+
+impl MirrorArchiveSigner {
+    /// Append the signature that authorizes `relative_url` (as resolved
+    /// against this metadata document) to the archive URL.
+    fn sign(&self, relative_url: &str, version: &str, os: &str, arch: &str) -> String {
+        let absolute = format!("{}/{}/download/{}/{}", self.base_path, version, os, arch);
+        format!(
+            "{}?{}",
+            relative_url,
+            mirror_url_signing::signed_query(
+                &self.secret,
+                &absolute,
+                self.user_id,
+                self.expires_at_unix,
+            )
+        )
+    }
 }
 
 /// GET /:repo_key/:hostname/:namespace/:type/:version/download/:os/:arch —
@@ -3240,7 +3384,7 @@ mod tests {
             "zh:abc".to_string(),
         );
         // darwin/arm64 intentionally has no shasum.
-        let out = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        let out = assemble_mirror_archives("1.0.0", &platforms, &shasums, None);
         let archives = out["archives"].as_object().unwrap();
         assert_eq!(archives.len(), 2);
 
@@ -3253,9 +3397,100 @@ mod tests {
         assert!(dar.get("hashes").is_none());
     }
 
+    /// The mirror archive route, and only it, may be opened by a signed URL.
+    #[test]
+    fn test_is_mirror_archive_path() {
+        assert!(is_mirror_archive_path(
+            "/terraform/tofu/registry.opentofu.org/hashicorp/aws/6.2.0/download/linux/amd64"
+        ));
+        // The provider REGISTRY download route has the same tail but two more
+        // segments; it authenticates normally and must not match.
+        assert!(!is_mirror_archive_path(
+            "/terraform/tofu/v1/providers/hashicorp/aws/6.2.0/download/linux/amd64"
+        ));
+        // Metadata documents, uploads and other formats never match.
+        assert!(!is_mirror_archive_path(
+            "/terraform/tofu/registry.opentofu.org/hashicorp/aws/6.2.0.json"
+        ));
+        assert!(!is_mirror_archive_path(
+            "/terraform/tofu/registry.opentofu.org/hashicorp/aws/6.2.0/download/linux/amd64/extra"
+        ));
+        assert!(!is_mirror_archive_path("/npm/tofu/some/pkg"));
+        assert!(!is_mirror_archive_path("/terraform"));
+    }
+
+    /// The emitted URL is relative, so what the signature must cover is the
+    /// path the *client* ends up requesting after resolving it against the
+    /// `<version>.json` URL. Walk that resolution explicitly and check the
+    /// signature verifies against the result — this is the join between the
+    /// handler that mints and the middleware that verifies.
+    #[test]
+    fn test_signed_archive_url_verifies_at_the_path_the_client_will_request() {
+        let secret = "test-secret-key-that-is-at-least-32-bytes";
+        let user_id = uuid::Uuid::new_v4();
+        let metadata_path = "/terraform/tofu/registry.opentofu.org/hashicorp/aws/6.2.0.json";
+        let signer = MirrorArchiveSigner {
+            base_path: metadata_path.rsplit_once('/').unwrap().0.to_string(),
+            secret: secret.to_string(),
+            user_id,
+            expires_at_unix: chrono::Utc::now().timestamp() + 300,
+        };
+
+        let platforms = vec![("linux".to_string(), "amd64".to_string())];
+        let out = assemble_mirror_archives(
+            "6.2.0",
+            &platforms,
+            &std::collections::HashMap::new(),
+            Some(&signer),
+        );
+        let url = out["archives"]["linux_amd64"]["url"].as_str().unwrap();
+
+        let (relative, query) = url.split_once('?').expect("signed url carries a query");
+        assert_eq!(relative, "6.2.0/download/linux/amd64");
+
+        // Resolve the relative reference against the metadata URL the way the
+        // client does: replace the last segment of the metadata path.
+        let resolved = format!("{}/{}", metadata_path.rsplit_once('/').unwrap().0, relative);
+        let claims = crate::services::mirror_url_signing::verify(
+            secret,
+            &resolved,
+            Some(query),
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("signature verifies at the resolved path");
+        assert_eq!(claims.user_id, user_id);
+
+        // A different platform's archive is a different path, so its signature
+        // must not open this one.
+        let other = format!(
+            "{}/6.2.0/download/darwin/arm64",
+            metadata_path.rsplit_once('/').unwrap().0
+        );
+        assert!(crate::services::mirror_url_signing::verify(
+            secret,
+            &other,
+            Some(query),
+            chrono::Utc::now().timestamp()
+        )
+        .is_none());
+    }
+
+    /// Without a signer the emitted document is byte-for-byte what it was
+    /// before signed URLs existed: public repositories are unaffected.
+    #[test]
+    fn test_unsigned_archive_urls_are_unchanged() {
+        let platforms = vec![("linux".to_string(), "amd64".to_string())];
+        let out =
+            assemble_mirror_archives("6.2.0", &platforms, &std::collections::HashMap::new(), None);
+        assert_eq!(
+            out["archives"]["linux_amd64"]["url"],
+            "6.2.0/download/linux/amd64"
+        );
+    }
+
     #[test]
     fn test_assemble_mirror_archives_empty() {
-        let out = assemble_mirror_archives("1.0.0", &[], &std::collections::HashMap::new());
+        let out = assemble_mirror_archives("1.0.0", &[], &std::collections::HashMap::new(), None);
         assert!(out["archives"].as_object().unwrap().is_empty());
     }
 
@@ -3280,7 +3515,7 @@ mod tests {
         if let Some(h) = registry_shasum_to_mirror_hash(&download) {
             shasums.insert(("linux".to_string(), "amd64".to_string()), h);
         }
-        let archives = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        let archives = assemble_mirror_archives("1.0.0", &platforms, &shasums, None);
         assert_eq!(
             archives["archives"]["linux_amd64"]["url"],
             "1.0.0/download/linux/amd64"
@@ -3532,7 +3767,7 @@ mod tests {
             shasum: "21c38f6b".to_string(),
         }];
         let (platforms, shasums) = local_packages_to_archive_inputs(&packages);
-        let doc = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        let doc = assemble_mirror_archives("1.0.0", &platforms, &shasums, None);
         assert_eq!(
             doc,
             serde_json::json!({
